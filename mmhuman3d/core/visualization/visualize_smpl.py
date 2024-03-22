@@ -1,37 +1,29 @@
 # yapf: disable
 import copy
 import glob
+import mmcv
+import numpy as np
 import os
 import os.path as osp
 import shutil
+import torch
+import torch.nn as nn
 import warnings
+from colormap import Color
 from functools import partial
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-import mmcv
-import numpy as np
-import torch
-import torch.nn as nn
-from colormap import Color
-
-from mmhuman3d.core.cameras import (
-    WeakPerspectiveCameras,
-    compute_orbit_cameras,
-)
+from mmhuman3d.core.cameras import WeakPerspectiveCameras, compute_orbit_cameras
 from mmhuman3d.core.cameras.builder import build_cameras
-from mmhuman3d.core.conventions.cameras.convert_convention import \
-    convert_camera_matrix  # prevent yapf isort conflict
+from mmhuman3d.core.renderer.torch3d_renderer.builder import build_renderer
+from mmhuman3d.core.conventions.cameras.convert_convention import convert_camera_matrix  # prevent yapf isort conflict
 from mmhuman3d.core.conventions.segmentation import body_segmentation
 from mmhuman3d.core.renderer.torch3d_renderer import render_runner
-from mmhuman3d.core.renderer.torch3d_renderer.meshes import \
-    ParametricMeshes  # noqa: E501
-from mmhuman3d.core.renderer.torch3d_renderer.render_smpl_config import (
-    RENDER_CONFIGS,
-)
+from mmhuman3d.core.renderer.torch3d_renderer.meshes import ParametricMeshes  # noqa: E501
+from mmhuman3d.core.renderer.torch3d_renderer.render_smpl_config import RENDER_CONFIGS
 from mmhuman3d.core.renderer.torch3d_renderer.smpl_renderer import SMPLRenderer
-from mmhuman3d.core.renderer.torch3d_renderer.utils import \
-    align_input_to_padded  # noqa: E501
+from mmhuman3d.core.renderer.torch3d_renderer.utils import align_input_to_padded  # noqa: E501
 from mmhuman3d.models.body_models.builder import build_body_model
 from mmhuman3d.utils.demo_utils import (
     convert_bbox_to_intrinsic,
@@ -59,9 +51,18 @@ except ImportError:
     from typing_extensions import Literal
 
 
-def _prepare_background(image_array, frame_list, origin_frames, output_path,
-                        start, end, img_format, overwrite, num_frames,
-                        read_frames_batch):
+def _prepare_background(
+    image_array,
+    frame_list,
+    origin_frames,
+    output_path,
+    start,
+    end,
+    img_format,
+    overwrite,
+    num_frames,
+    read_frames_batch,
+):
     """Compare among `image_array`, `frame_list` and `origin_frames` and decide
     whether to save the temp background images."""
     if num_frames > 300:
@@ -90,13 +91,13 @@ def _prepare_background(image_array, frame_list, origin_frames, output_path,
             allowed_suffix=['.mp4', 'gif', ''],
             tag='output video',
             path_type='auto',
-            overwrite=overwrite)
+            overwrite=overwrite,
+        )
         if image_array is None:
             # choose in frame_list or origin_frames
             # if all None, will use pure white background
             if frame_list is None and origin_frames is None:
-                print(
-                    'No background provided, will use pure white background.')
+                print('No background provided, will use pure white background.')
             elif frame_list is not None and origin_frames is not None:
                 warnings.warn('Redundant input, will only use frame_list.')
                 origin_frames = None
@@ -104,30 +105,20 @@ def _prepare_background(image_array, frame_list, origin_frames, output_path,
             # read the origin frames as array if any.
             if frame_list is None and origin_frames is not None:
                 check_input_path(
-                    input_path=origin_frames,
-                    allowed_suffix=['.mp4', '.gif', ''],
-                    tag='origin frames',
-                    path_type='auto')
+                    input_path=origin_frames, allowed_suffix=['.mp4', '.gif', ''], tag='origin frames', path_type='auto'
+                )
                 # if origin_frames is a video, write it as a folder of images
                 # if read_frames_batch is True, else read directly as an array.
                 if Path(origin_frames).is_file():
                     if read_frames_batch:
-                        frames_folder = osp.join(
-                            Path(output_path).parent,
-                            Path(output_path).name + '_input_temp')
+                        frames_folder = osp.join(Path(output_path).parent, Path(output_path).name + '_input_temp')
                         os.makedirs(frames_folder, exist_ok=True)
-                        video_to_images(
-                            origin_frames,
-                            frames_folder,
-                            img_format=img_format,
-                            start=start,
-                            end=end)
+                        video_to_images(origin_frames, frames_folder, img_format=img_format, start=start, end=end)
                         remove_folder = True
                     else:
                         remove_folder = False
                         frames_folder = None
-                        image_array = video_to_array(
-                            origin_frames, start=start, end=end)
+                        image_array = video_to_array(origin_frames, start=start, end=end)
                 # if origin_frames is a folder, write it as a folder of images
                 # read the folder as an array if read_frames_batch is True
                 # else return frames_folder for reading during rendering.
@@ -137,36 +128,22 @@ def _prepare_background(image_array, frame_list, origin_frames, output_path,
                         remove_folder = False
                         image_array = None
                     else:
-                        image_array = images_to_array(
-                            origin_frames,
-                            img_format=img_format,
-                            start=start,
-                            end=end)
+                        image_array = images_to_array(origin_frames, img_format=img_format, start=start, end=end)
                         remove_folder = False
                         frames_folder = origin_frames
             # if frame_list is not None, move the images into a folder
             # read the folder as an array if read_frames_batch is True
             # else return frames_folder for reading during rendering.
             elif frame_list is not None and origin_frames is None:
-                frames_folder = osp.join(
-                    Path(output_path).parent,
-                    Path(output_path).name + '_input_temp')
+                frames_folder = osp.join(Path(output_path).parent, Path(output_path).name + '_input_temp')
                 os.makedirs(frames_folder, exist_ok=True)
                 for frame_idx, frame_path in enumerate(frame_list):
-                    if check_path_suffix(
-                            path_str=frame_path,
-                            allowed_suffix=['.jpg', '.png', '.jpeg']):
-                        shutil.copy(
-                            frame_path,
-                            os.path.join(frames_folder,
-                                         '%06d.png' % frame_idx))
+                    if check_path_suffix(path_str=frame_path, allowed_suffix=['.jpg', '.png', '.jpeg']):
+                        shutil.copy(frame_path, os.path.join(frames_folder, '%06d.png' % frame_idx))
                         img_format = '%06d.png'
                 if not read_frames_batch:
 
-                    image_array = images_to_array(
-                        frames_folder,
-                        img_format=img_format,
-                        remove_raw_files=True)
+                    image_array = images_to_array(frames_folder, img_format=img_format, remove_raw_files=True)
                     frames_folder = None
                     remove_folder = False
                 else:
@@ -185,8 +162,7 @@ def _prepare_body_model(body_model, body_model_config):
 
             model_type = body_model_config.get('type').lower()
             if model_type not in ['smpl', 'smplx', 'star']:
-                raise ValueError(f'Do not support {model_type}, please choose'
-                                 f' in `smpl`, `smplx` or `star`.')
+                raise ValueError(f'Do not support {model_type}, please choose' f' in `smpl`, `smplx` or `star`.')
 
             if model_path and osp.isdir(model_path):
                 model_path = osp.join(model_path, model_type)
@@ -194,14 +170,12 @@ def _prepare_body_model(body_model, body_model_config):
                 body_model = build_body_model(body_model_config)
                 assert os.path.isdir(model_path)
             else:
-                raise FileNotFoundError('Wrong model_path.'
-                                        ' File or directory does not exist.')
+                raise FileNotFoundError('Wrong model_path.' ' File or directory does not exist.')
         else:
             raise ValueError('Please input body_model_config.')
     else:
         if body_model_config is not None:
-            warnings.warn('Redundant input, will take body_model directly'
-                          'and ignore body_model_config.')
+            warnings.warn('Redundant input, will take body_model directly' 'and ignore body_model_config.')
     return body_model
 
 
@@ -210,8 +184,7 @@ def _prepare_input_pose(verts, poses, betas, transl):
     if verts is None and poses is None:
         raise ValueError('Please input valid poses or verts.')
     elif (verts is not None) and (poses is not None):
-        warnings.warn('Redundant input, will take verts and ignore poses & '
-                      'betas & transl.')
+        warnings.warn('Redundant input, will take verts and ignore poses & ' 'betas & transl.')
         poses = None
         transl = None
         betas = None
@@ -265,10 +238,10 @@ def _prepare_mesh(poses, betas, transl, verts, start, end, body_model):
             if not body_pose_keys.issubset(poses):
                 raise KeyError(
                     f'{str(poses.keys())}, Please make sure that your '
-                    f'input dict has all of {", ".join(body_pose_keys)}')
+                    f'input dict has all of {", ".join(body_pose_keys)}'
+                )
             num_frames = poses['body_pose'].shape[0]
-            _, num_person, _ = poses['body_pose'].view(
-                num_frames, -1, NUM_BODY_JOINTS * 3).shape
+            _, num_person, _ = poses['body_pose'].view(num_frames, -1, NUM_BODY_JOINTS * 3).shape
 
             full_pose = body_model.dict2tensor(poses)
             full_pose = full_pose[start:end]
@@ -277,7 +250,8 @@ def _prepare_mesh(poses, betas, transl, verts, start, end, body_model):
             if poses.shape[-1] != NUM_DIM:
                 raise ValueError(
                     f'Please make sure your poses is {NUM_DIM} dims in'
-                    f'the last axis. Your input shape: {poses.shape}')
+                    f'the last axis. Your input shape: {poses.shape}'
+                )
             poses = poses.view(poses.shape[0], -1, (NUM_JOINTS + 1) * 3)
             num_frames, num_person, _ = poses.shape
             full_pose = poses[start:end]
@@ -292,50 +266,40 @@ def _prepare_mesh(poses, betas, transl, verts, start, end, body_model):
 
                 if betas.shape[1] == 1:
                     betas = betas.repeat(1, num_person, 1)
-                    warnings.warn(
-                        'Only one betas for multi-person, will all be the '
-                        'same body shape.')
+                    warnings.warn('Only one betas for multi-person, will all be the ' 'same body shape.')
                 elif betas.shape[1] > num_person:
                     betas = betas[:, :num_person]
-                    warnings.warn(
-                        f'Betas shape exceed, will be sliced as {betas.shape}.'
-                    )
+                    warnings.warn(f'Betas shape exceed, will be sliced as {betas.shape}.')
                 elif betas.shape[1] == num_person:
                     pass
                 else:
                     raise ValueError(
-                        f'Odd betas shape: {betas.shape}, inconsistent'
-                        f'with poses in num_person: {poses.shape}.')
+                        f'Odd betas shape: {betas.shape}, inconsistent' f'with poses in num_person: {poses.shape}.'
+                    )
             else:
-                warnings.warn('None betas for multi-person, will all be the '
-                              'default body shape.')
+                warnings.warn('None betas for multi-person, will all be the ' 'default body shape.')
 
             if transl is not None:
                 transl = transl.view(poses.shape[0], -1, 3)
                 if transl.shape[1] == 1:
                     transl = transl.repeat(1, num_person, 1)
-                    warnings.warn(
-                        'Only one transl for multi-person, will all be the '
-                        'same translation.')
+                    warnings.warn('Only one transl for multi-person, will all be the ' 'same translation.')
                 elif transl.shape[1] > num_person:
                     transl = transl[:, :num_person]
-                    warnings.warn(f'Transl shape exceed, will be sliced as'
-                                  f'{transl.shape}.')
+                    warnings.warn(f'Transl shape exceed, will be sliced as' f'{transl.shape}.')
                 elif transl.shape[1] == num_person:
                     pass
                 else:
                     raise ValueError(
-                        f'Odd transl shape: {transl.shape}, inconsistent'
-                        f'with poses in num_person: {poses.shape}.')
+                        f'Odd transl shape: {transl.shape}, inconsistent' f'with poses in num_person: {poses.shape}.'
+                    )
             else:
-                warnings.warn('None transl for multi-person, will all be the '
-                              'default translation.')
+                warnings.warn('None transl for multi-person, will all be the ' 'default translation.')
 
         # slice the input poses, betas, and transl.
         betas = betas[start:end] if betas is not None else None
         transl = transl[start:end] if transl is not None else None
-        pose_dict = body_model.tensor2dict(
-            full_pose=full_pose, betas=betas, transl=transl)
+        pose_dict = body_model.tensor2dict(full_pose=full_pose, betas=betas, transl=transl)
 
         # get new num_frames
         num_frames = full_pose.shape[0]
@@ -348,15 +312,12 @@ def _prepare_mesh(poses, betas, transl, verts, start, end, body_model):
         if isinstance(verts, np.ndarray):
             verts = torch.Tensor(verts)
         verts = verts[start:end]
-        pose_dict = body_model.tensor2dict(
-            torch.zeros(1, (NUM_JOINTS + 1) * 3))
+        pose_dict = body_model.tensor2dict(torch.zeros(1, (NUM_JOINTS + 1) * 3))
 
         if verts.ndim == 3:
-            joints = torch.einsum('bik,ji->bjk',
-                                  [verts, body_model.J_regressor])
+            joints = torch.einsum('bik,ji->bjk', [verts, body_model.J_regressor])
         elif verts.ndim == 4:
-            joints = torch.einsum('fpik,ji->fpjk',
-                                  [verts, body_model.J_regressor])
+            joints = torch.einsum('fpik,ji->fpjk', [verts, body_model.J_regressor])
         num_verts = body_model.NUM_VERTS
         assert verts.shape[-2] == num_verts, 'Wrong input verts shape.'
         num_frames = verts.shape[0]
@@ -390,97 +351,89 @@ def _prepare_colors(palette, render_choice, num_person, num_verts, model_type):
             if palette.max() > 1:
                 palette = palette / 255.0
             palette = torch.clip(palette, min=0, max=1)
-            colors = palette.view(num_person,
-                                  3).unsqueeze(1).repeat(1, num_verts, 1)
+            colors = palette.view(num_person, 3).unsqueeze(1).repeat(1, num_verts, 1)
 
         elif isinstance(palette, list):
             colors = []
             for person_idx in range(num_person):
 
                 if palette[person_idx] == 'random':
-                    color_person = get_different_colors(
-                        num_person, int_dtype=False)[person_idx]
+                    color_person = get_different_colors(num_person, int_dtype=False)[person_idx]
                     color_person = torch.FloatTensor(color_person)
-                    color_person = torch.clip(
-                        color_person * 1.5, min=0.6, max=1)
-                    color_person = color_person.view(1, 1, 3).repeat(
-                        1, num_verts, 1)
+                    color_person = torch.clip(color_person * 1.5, min=0.6, max=1)
+                    color_person = color_person.view(1, 1, 3).repeat(1, num_verts, 1)
                 elif palette[person_idx] == 'segmentation':
                     verts_labels = torch.zeros(num_verts)
                     color_person = torch.ones(1, num_verts, 3)
-                    color_part = get_different_colors(
-                        len(body_segger), int_dtype=False)
+                    color_part = get_different_colors(len(body_segger), int_dtype=False)
                     for part_idx, k in enumerate(body_segger.keys()):
                         index = body_segger[k]
                         verts_labels[index] = part_idx
-                        color_person[:, index] = torch.FloatTensor(
-                            color_part[part_idx])
+                        color_person[:, index] = torch.FloatTensor(color_part[part_idx])
                 elif palette[person_idx] in Color.color_names:
-                    color_person = torch.FloatTensor(
-                        Color(palette[person_idx]).rgb).view(1, 1, 3).repeat(
-                            1, num_verts, 1)
+                    color_person = (
+                        torch.FloatTensor(Color(palette[person_idx]).rgb).view(1, 1, 3).repeat(1, num_verts, 1)
+                    )
                 else:
-                    raise ValueError('Wrong palette string. '
-                                     'Please choose in the pre-defined range.')
+                    raise ValueError('Wrong palette string. ' 'Please choose in the pre-defined range.')
                 colors.append(color_person)
             colors = torch.cat(colors, 0)
             assert colors.shape == (num_person, num_verts, 3)
             # the color passed to renderer will be (num_person, num_verts, 3)
         else:
-            raise ValueError(
-                'Palette should be tensor, array or list of strs.')
+            raise ValueError('Palette should be tensor, array or list of strs.')
     return colors
 
 
 def render_smpl(
-        # smpl parameters
-        poses: Optional[Union[torch.Tensor, np.ndarray, dict]] = None,
-        betas: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        transl: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        verts: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        body_model: Optional[nn.Module] = None,
-        body_model_config: Optional[dict] = None,
-        # camera parameters
-        R: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        T: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        K: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        orig_cam: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        Ks: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        in_ndc: bool = True,
-        convention: str = 'pytorch3d',
-        projection: Literal['weakperspective', 'perspective', 'fovperspective',
-                            'orthographics',
-                            'fovorthographics'] = 'perspective',
-        orbit_speed: Union[float, Tuple[float, float]] = 0.0,
-        # render choice parameters
-        render_choice: Literal['lq', 'mq', 'hq', 'silhouette', 'depth',
-                               'normal', 'pointcloud',
-                               'part_silhouette'] = 'hq',
-        palette: Union[List[str], str, np.ndarray, torch.Tensor] = 'white',
-        texture_image: Union[torch.Tensor, np.ndarray] = None,
-        resolution: Optional[Union[List[int], Tuple[int, int]]] = None,
-        start: int = 0,
-        end: Optional[int] = None,
-        alpha: float = 1.0,
-        no_grad: bool = True,
-        batch_size: int = 10,
-        device: Union[torch.device, str] = 'cuda',
-        # file io parameters
-        return_tensor: bool = False,
-        output_path: str = None,
-        origin_frames: Optional[str] = None,
-        frame_list: Optional[List[str]] = None,
-        image_array: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        img_format: str = '%06d.png',
-        overwrite: bool = False,
-        mesh_file_path: Optional[str] = None,
-        read_frames_batch: bool = False,
-        # visualize keypoints
-        plot_kps: bool = False,
-        kp3d: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        mask: Optional[Union[np.ndarray, List[int]]] = None,
-        vis_kp_index: bool = False,
-        verbose: bool = False) -> Union[None, torch.Tensor]:
+    # smpl parameters
+    poses: Optional[Union[torch.Tensor, np.ndarray, dict]] = None,
+    betas: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    transl: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    verts: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    body_model: Optional[nn.Module] = None,
+    body_model_config: Optional[dict] = None,
+    # camera parameters
+    R: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    T: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    K: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    orig_cam: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    Ks: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    in_ndc: bool = True,
+    convention: str = 'pytorch3d',
+    projection: Literal[
+        'weakperspective', 'perspective', 'fovperspective', 'orthographics', 'fovorthographics'
+    ] = 'perspective',
+    orbit_speed: Union[float, Tuple[float, float]] = 0.0,
+    # render choice parameters
+    render_choice: Literal['lq', 'mq', 'hq', 'silhouette', 'depth', 'normal', 'pointcloud', 'part_silhouette'] = 'hq',
+    palette: Union[List[str], str, np.ndarray, torch.Tensor] = 'white',
+    texture_image: Union[torch.Tensor, np.ndarray] = None,
+    uv_obj_path: Optional[str] = None,
+    resolution: Optional[Union[List[int], Tuple[int, int]]] = None,
+    start: int = 0,
+    end: Optional[int] = None,
+    alpha: float = 1.0,
+    no_grad: bool = True,
+    batch_size: int = 10,
+    device: Union[torch.device, str] = 'cuda',
+    # file io parameters
+    return_tensor: bool = False,
+    output_path: str = None,
+    origin_frames: Optional[str] = None,
+    frame_list: Optional[List[str]] = None,
+    image_array: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    img_format: str = '%06d.png',
+    overwrite: bool = False,
+    mesh_file_path: Optional[str] = None,
+    read_frames_batch: bool = False,
+    # visualize keypoints
+    plot_kps: bool = False,
+    kp3d: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    mask: Optional[Union[np.ndarray, List[int]]] = None,
+    vis_kp_index: bool = False,
+    verbose: bool = False,
+) -> Union[None, torch.Tensor]:
     """Render SMPL, SMPL-X or STAR mesh or silhouette into differentiable
     tensors, and export video or images.
 
@@ -743,16 +696,14 @@ def render_smpl(
     elif isinstance(resolution, list):
         resolution = tuple(resolution)
 
-    verts, poses, betas, transl = _prepare_input_pose(verts, poses, betas,
-                                                      transl)
+    verts, poses, betas, transl = _prepare_input_pose(verts, poses, betas, transl)
 
     body_model = _prepare_body_model(body_model, body_model_config)
     model_type = body_model.name().replace('-', '').lower()
     assert model_type in ['smpl', 'smplx', 'star']
 
     if model_type in ['smpl', 'smplx']:
-        vertices, joints, num_frames, num_person = _prepare_mesh(
-            poses, betas, transl, verts, start, end, body_model)
+        vertices, joints, num_frames, num_person = _prepare_mesh(poses, betas, transl, verts, start, end, body_model)
     elif model_type == 'star':
         model_output = body_model(body_pose=poses, betas=betas, transl=transl)
         vertices = model_output['vertices']
@@ -769,17 +720,27 @@ def render_smpl(
             kp3d = None
 
     image_array, remove_folder, frames_folder = _prepare_background(
-        image_array, frame_list, origin_frames, output_path, start, end,
-        img_format, overwrite, num_frames, read_frames_batch)
+        image_array,
+        frame_list,
+        origin_frames,
+        output_path,
+        start,
+        end,
+        img_format,
+        overwrite,
+        num_frames,
+        read_frames_batch,
+    )
 
     render_resolution = None
     if image_array is not None:
         render_resolution = (image_array.shape[1], image_array.shape[2])
     elif frames_folder is not None:
-        frame_path_list = glob.glob(osp.join(
-            frames_folder, '*.jpg')) + glob.glob(
-                osp.join(frames_folder, '*.png')) + glob.glob(
-                    osp.join(frames_folder, '*.jpeg'))
+        frame_path_list = (
+            glob.glob(osp.join(frames_folder, '*.jpg'))
+            + glob.glob(osp.join(frames_folder, '*.png'))
+            + glob.glob(osp.join(frames_folder, '*.jpeg'))
+        )
         vid_info = vid_info_reader(frame_path_list[0])
         render_resolution = (int(vid_info['height']), int(vid_info['width']))
     if resolution is not None:
@@ -788,7 +749,8 @@ def render_smpl(
                 warnings.warn(
                     f'Size of background: {render_resolution} !='
                     f' resolution: {resolution}, the output video will be '
-                    f'resized as {resolution}')
+                    f'resized as {resolution}'
+                )
             final_resolution = resolution
         elif render_resolution is None:
             render_resolution = final_resolution = resolution
@@ -815,10 +777,7 @@ def render_smpl(
     elif model_type == 'smplx':
         render_param_dict.update(num_class=27)
 
-    if render_choice not in [
-            'hq', 'mq', 'lq', 'silhouette', 'part_silhouette', 'depth',
-            'pointcloud', 'normal'
-    ]:
+    if render_choice not in ['hq', 'mq', 'lq', 'silhouette', 'part_silhouette', 'depth', 'pointcloud', 'normal']:
         raise ValueError('Please choose the right render_choice.')
 
     # body part colorful visualization should use flat shader to be sharper.
@@ -836,11 +795,19 @@ def render_smpl(
                 else:
                     print('Repeat palette for multi-person.')
         else:
-            raise ValueError('Wrong input palette type. '
-                             'Palette should be tensor, array or list of strs')
-        colors_all = _prepare_colors(palette, render_choice, num_person,
-                                     num_verts, model_type)
+            raise ValueError('Wrong input palette type. ' 'Palette should be tensor, array or list of strs')
+        colors_all = _prepare_colors(palette, render_choice, num_person, num_verts, model_type)
         colors_all = colors_all.view(-1, num_person * num_verts, 3)
+        uv_renderer = None
+    else:
+        colors_all = None
+        uv_renderer = build_renderer(
+            dict(
+                type='uv',
+                device=device,
+                obj_path=uv_obj_path,
+            )
+        )
     # verts of ParametricMeshes should be in (N, V, 3)
     vertices = vertices.view(num_frames, -1, 3)
     meshes = ParametricMeshes(
@@ -848,9 +815,11 @@ def render_smpl(
         verts=vertices,
         N_individual_overdide=num_person,
         model_type=model_type,
-        texture_image=texture_image,
+        texture_images=texture_image,
+        uv_renderer=uv_renderer,
         use_nearest=bool(render_choice == 'part_silhouette'),
-        vertex_color=colors_all)
+        vertex_color=colors_all,
+    )
 
     # write .ply or .obj files
     if mesh_file_path is not None:
@@ -860,17 +829,13 @@ def render_smpl(
             mesh_person = meshes[:, person_idx]
             if texture_image is None:
                 ply_paths = [
-                    f'{mesh_file_path}/frame{frame_idx}_'
-                    f'person{person_idx}.ply'
-                    for frame_idx in range(num_frames)
+                    f'{mesh_file_path}/frame{frame_idx}_' f'person{person_idx}.ply' for frame_idx in range(num_frames)
                 ]
                 save_meshes_as_plys(meshes=mesh_person, files=ply_paths)
 
             else:
                 obj_paths = [
-                    f'{mesh_file_path}/frame{frame_idx}_'
-                    f'person{person_idx}.obj'
-                    for frame_idx in range(num_frames)
+                    f'{mesh_file_path}/frame{frame_idx}_' f'person{person_idx}.obj' for frame_idx in range(num_frames)
                 ]
                 save_meshes_as_objs(meshes=mesh_person, files=obj_paths)
 
@@ -915,12 +880,10 @@ def render_smpl(
         vertices[..., 1] += ty.view(num_frames, num_person, 1)
         vertices[..., 0] *= sx.view(num_frames, num_person, 1)
         vertices[..., 1] *= sy.view(num_frames, num_person, 1)
-        orig_cam = torch.tensor([1.0, 1.0, 0.0,
-                                 0.0]).view(1, 4).repeat(num_frames, 1)
+        orig_cam = torch.tensor([1.0, 1.0, 0.0, 0.0]).view(1, 4).repeat(num_frames, 1)
         K, R, T = WeakPerspectiveCameras.convert_orig_cam_to_matrix(
-            orig_cam=orig_cam,
-            znear=torch.min(vertices[..., 2] - 1),
-            aspect_ratio=r)
+            orig_cam=orig_cam, znear=torch.min(vertices[..., 2] - 1), aspect_ratio=r
+        )
 
     if num_person > 1:
         vertices = vertices.reshape(num_frames, -1, 3)
@@ -935,7 +898,8 @@ def render_smpl(
             at=(torch.mean(vertices.view(-1, 3), 0)).detach().cpu(),
             orbit_speed=orbit_speed,
             batch_size=num_frames,
-            convention=convention)
+            convention=convention,
+        )
         convention = 'pytorch3d'
 
     if isinstance(R, np.ndarray):
@@ -983,14 +947,15 @@ def render_smpl(
             K = K[start:end]
 
     assert projection in [
-        'perspective', 'weakperspective', 'orthographics', 'fovorthographics',
-        'fovperspective'
+        'perspective',
+        'weakperspective',
+        'orthographics',
+        'fovorthographics',
+        'fovperspective',
     ], f'Wrong camera projection: {projection}'
     if projection in ['fovperspective', 'perspective']:
         is_perspective = True
-    elif projection in [
-            'fovorthographics', 'weakperspective', 'orthographics'
-    ]:
+    elif projection in ['fovorthographics', 'weakperspective', 'orthographics']:
         is_perspective = False
     if projection in ['fovperspective', 'fovorthographics', 'weakperspective']:
         assert in_ndc
@@ -1004,7 +969,8 @@ def render_smpl(
         convention_src=convention,
         resolution_src=render_resolution,
         in_ndc_src=in_ndc,
-        in_ndc_dst=in_ndc)
+        in_ndc_dst=in_ndc,
+    )
 
     # initialize the renderer.
     renderer = SMPLRenderer(
@@ -1019,22 +985,16 @@ def render_smpl(
         plot_kps=plot_kps,
         vis_kp_index=vis_kp_index,
         final_resolution=final_resolution,
-        **render_param_dict)
+        **render_param_dict,
+    )
 
     cameras = build_cameras(
-        dict(
-            type=projection,
-            in_ndc=in_ndc,
-            device=device,
-            K=K,
-            R=R,
-            T=T,
-            resolution=render_resolution))
+        dict(type=projection, in_ndc=in_ndc, device=device, K=K, R=R, T=T, resolution=render_resolution)
+    )
 
     if image_array is not None:
         image_array = torch.Tensor(image_array)
-        image_array = align_input_to_padded(
-            image_array, ndim=4, batch_size=num_frames, padding_mode='ones')
+        image_array = align_input_to_padded(image_array, ndim=4, batch_size=num_frames, padding_mode='ones')
     # prepare the render data.
     render_data = dict(
         images=image_array,
@@ -1052,7 +1012,8 @@ def render_smpl(
         return_tensor=return_tensor,
         no_grad=no_grad,
         verbose=verbose,
-        **render_data)
+        **render_data,
+    )
 
     if remove_folder:
         if Path(frames_folder).is_dir():
@@ -1075,36 +1036,22 @@ def visualize_smpl_calibration(
     screen."""
     assert K is not None, '`K` is required.'
     assert resolution is not None, '`resolution`(h, w) is required.'
-    func = partial(
-        render_smpl,
-        projection='perspective',
-        convention='opencv',
-        orig_cam=None,
-        in_ndc=False)
+    func = partial(render_smpl, projection='perspective', convention='opencv', orig_cam=None, in_ndc=False)
     for k in func.keywords.keys():
         if k in kwargs:
             kwargs.pop(k)
     return func(K=K, R=R, T=T, resolution=resolution, **kwargs)
 
 
-def visualize_smpl_hmr(cam_transl,
-                       bbox=None,
-                       kp2d=None,
-                       focal_length=5000,
-                       det_width=224,
-                       det_height=224,
-                       bbox_format='xyxy',
-                       **kwargs) -> None:
+def visualize_smpl_hmr(
+    cam_transl, bbox=None, kp2d=None, focal_length=5000, det_width=224, det_height=224, bbox_format='xyxy', **kwargs
+) -> None:
     """Simplest way to visualize HMR or SPIN or Smplify pred smpl with origin
     frames and predicted cameras."""
     if kp2d is not None:
         bbox = convert_kp2d_to_bbox(kp2d, bbox_format=bbox_format)
     Ks = convert_bbox_to_intrinsic(bbox, bbox_format=bbox_format)
-    K = torch.Tensor(
-        get_default_hmr_intrinsic(
-            focal_length=focal_length,
-            det_height=det_height,
-            det_width=det_width))
+    K = torch.Tensor(get_default_hmr_intrinsic(focal_length=focal_length, det_height=det_height, det_width=det_width))
     func = partial(
         render_smpl,
         projection='perspective',
@@ -1116,33 +1063,35 @@ def visualize_smpl_hmr(cam_transl,
     )
     if isinstance(cam_transl, np.ndarray):
         cam_transl = torch.Tensor(cam_transl)
-    T = torch.cat([
-        cam_transl[..., [1]], cam_transl[..., [2]], 2 * focal_length /
-        (det_width * cam_transl[..., [0]] + 1e-9)
-    ], -1)
+    T = torch.cat(
+        [cam_transl[..., [1]], cam_transl[..., [2]], 2 * focal_length / (det_width * cam_transl[..., [0]] + 1e-9)], -1
+    )
     for k in func.keywords.keys():
         if k in kwargs:
             kwargs.pop(k)
     return func(Ks=Ks, K=K, T=T, **kwargs)
 
 
-def visualize_smpl_vibe(orig_cam=None,
-                        pred_cam=None,
-                        bbox=None,
-                        output_path='sample.mp4',
-                        resolution=None,
-                        aspect_ratio=1.0,
-                        bbox_scale_factor=1.25,
-                        bbox_format='xyxy',
-                        **kwargs) -> None:
+def visualize_smpl_vibe(
+    orig_cam=None,
+    pred_cam=None,
+    bbox=None,
+    output_path='sample.mp4',
+    resolution=None,
+    aspect_ratio=1.0,
+    bbox_scale_factor=1.25,
+    bbox_format='xyxy',
+    **kwargs,
+) -> None:
     """Simplest way to visualize pred smpl with origin frames and predicted
     cameras."""
     assert resolution is not None
     if pred_cam is not None and bbox is not None:
         orig_cam = torch.Tensor(
-            convert_crop_cam_to_orig_img(pred_cam, bbox, resolution[1],
-                                         resolution[0], aspect_ratio,
-                                         bbox_scale_factor, bbox_format))
+            convert_crop_cam_to_orig_img(
+                pred_cam, bbox, resolution[1], resolution[0], aspect_ratio, bbox_scale_factor, bbox_format
+            )
+        )
     assert orig_cam is not None, '`orig_cam` is required.'
 
     func = partial(
@@ -1154,24 +1103,16 @@ def visualize_smpl_vibe(orig_cam=None,
     for k in func.keywords.keys():
         if k in kwargs:
             kwargs.pop(k)
-    return func(
-        orig_cam=orig_cam,
-        output_path=output_path,
-        resolution=resolution,
-        **kwargs)
+    return func(orig_cam=orig_cam, output_path=output_path, resolution=resolution, **kwargs)
 
 
-def visualize_T_pose(num_frames,
-                     body_model_config=None,
-                     body_model=None,
-                     orbit_speed=1.0,
-                     **kwargs) -> None:
+def visualize_T_pose(num_frames, body_model_config=None, body_model=None, orbit_speed=1.0, **kwargs) -> None:
     """Simplest way to visualize a sequence of T pose."""
     assert num_frames > 0, '`num_frames` is required.'
     assert body_model_config is not None or body_model is not None
-    model_type = body_model_config[
-        'type'] if body_model_config is not None else body_model.name(
-        ).replace('-', '').lower()
+    model_type = (
+        body_model_config['type'] if body_model_config is not None else body_model.name().replace('-', '').lower()
+    )
     if model_type == 'smpl':
         poses = torch.zeros(num_frames, 72)
     else:
@@ -1187,16 +1128,14 @@ def visualize_T_pose(num_frames,
         K=None,
         R=None,
         T=None,
-        origin_frames=None)
+        origin_frames=None,
+    )
     for k in func.keywords.keys():
         if k in kwargs:
             kwargs.pop(k)
     return func(
-        poses=poses,
-        body_model_config=body_model_config,
-        body_model=body_model,
-        orbit_speed=orbit_speed,
-        **kwargs)
+        poses=poses, body_model_config=body_model_config, body_model=body_model, orbit_speed=orbit_speed, **kwargs
+    )
 
 
 def visualize_smpl_pose(poses=None, verts=None, **kwargs) -> None:
@@ -1205,9 +1144,7 @@ def visualize_smpl_pose(poses=None, verts=None, **kwargs) -> None:
     Cameras will focus on the center of smpl mesh. `orbit speed` is
     recommended.
     """
-    assert (poses
-            is not None) or (verts
-                             is not None), 'Pass either `poses` or `verts`.'
+    assert (poses is not None) or (verts is not None), 'Pass either `poses` or `verts`.'
     func = partial(
         render_smpl,
         convention='opencv',
@@ -1218,7 +1155,8 @@ def visualize_smpl_pose(poses=None, verts=None, **kwargs) -> None:
         in_ndc=True,
         origin_frames=None,
         frame_list=None,
-        image_array=None)
+        image_array=None,
+    )
     for k in func.keywords.keys():
         if k in kwargs:
             kwargs.pop(k)
